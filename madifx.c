@@ -2448,6 +2448,11 @@ static int snd_madifx_hw_free(struct snd_pcm_substream *substream)
 	struct madifx_pcm_group *group = snd_pcm_substream_chip(substream);
 	struct mfx *mfx = group->mfx;
 	int i, pt_base, n_pages;
+	bool last_stream;
+
+	spin_lock_irq(&mfx->lock);
+	last_stream = (mfx->running_count == 0);
+	spin_unlock_irq(&mfx->lock);
 
 	if (substream->stream == SNDRV_PCM_STREAM_PLAYBACK) {
 		pt_base = group_pt_out_base(group);
@@ -2460,8 +2465,10 @@ static int snd_madifx_hw_free(struct snd_pcm_substream *substream)
 				     MADIFX_PAGE_ADDRESS_LIST + 4 * (pt_base + i),
 				     mfx->dummy_dma_addr);
 		}
-		for (i = 0; i < 32; ++i)
-			snd_madifx_enable_out(mfx, i, 0);
+		if (last_stream) {
+			for (i = 0; i < 32; ++i)
+				snd_madifx_enable_out(mfx, i, 0);
+		}
 	} else {
 		pt_base = group_pt_in_base(group);
 		n_pages  = group_pt_pages(group);
@@ -2472,8 +2479,10 @@ static int snd_madifx_hw_free(struct snd_pcm_substream *substream)
 				     MADIFX_PAGE_ADDRESS_LIST + 4 * (pt_base + i),
 				     mfx->dummy_dma_addr);
 		}
-		for (i = 0; i < 32; ++i)
-			snd_madifx_enable_in(mfx, i, 0);
+		if (last_stream) {
+			for (i = 0; i < 32; ++i)
+				snd_madifx_enable_in(mfx, i, 0);
+		}
 	}
 
 	snd_pcm_lib_free_pages(substream);
