@@ -2660,9 +2660,6 @@ static int snd_madifx_playback_open(struct snd_pcm_substream *substream)
 	runtime->hw.buffer_bytes_max  = group_dma_size(group);
 	runtime->hw.period_bytes_max  = group_dma_size(group);
 
-	if (!group->capture_substream)
-		madifx_stop_audio(mfx);
-
 	group->playback_pid       = current->pid;
 	group->playback_substream = substream;
 
@@ -2706,9 +2703,6 @@ static int snd_madifx_capture_open(struct snd_pcm_substream *substream)
 	runtime->hw.channels_max      = group->n_channels;
 	runtime->hw.buffer_bytes_max  = group_dma_size(group);
 	runtime->hw.period_bytes_max  = group_dma_size(group);
-
-	if (!group->playback_substream)
-		madifx_stop_audio(mfx);
 
 	group->capture_pid       = current->pid;
 	group->capture_substream = substream;
