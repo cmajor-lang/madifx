@@ -305,6 +305,35 @@ enum {
 #define INPUT_DMA_BUFFER_SIZE (NUM_INPUTS_S_MFXT*32768)
 #define OUTPUT_DMA_BUFFER_SIZE (NUM_OUTPUTS_S_MFXT*32768)
 
+/* Per-stream DMA page counts and sizes */
+#define MADIFX_HW_PAGE_SIZE  4096
+#define NUM_AES_PAGES        (32768*2/MADIFX_HW_PAGE_SIZE)   /* 16: 2ch */
+#define NUM_DMA_CH_PAGES     (32768*8/MADIFX_HW_PAGE_SIZE)   /* 64: 8ch slot */
+#define NUM_MADI_PAGES       (32768*192/MADIFX_HW_PAGE_SIZE) /* 1536: all MADI */
+
+/* PCM device (group) types */
+#define MADIFX_PCM_TYPE_AES    0
+#define MADIFX_PCM_TYPE_MADI   1
+#define MADIFX_PCM_TYPE_PHONES 2
+
+/* 24 MADI streams (3 ports × 8 streams of 8ch each) + AES + Phones */
+#define MADIFX_NUM_MADI_STREAMS 24
+#define MADIFX_NUM_PCM_GROUPS   26
+
+/* Output page-table base indices (within first 2048 entries) */
+#define MADIFX_PT_OUT_AES        0
+#define MADIFX_PT_OUT_PHONES     (1 * NUM_DMA_CH_PAGES)
+#define MADIFX_PT_OUT_MADI(n)    ((2 + (n)) * NUM_DMA_CH_PAGES)
+
+/* Input page-table base indices (within second 2048 entries) */
+#define MADIFX_PT_IN_BASE        (MADIFX_MAX_PAGE_TABLE_SIZE / 2)
+#define MADIFX_PT_IN_AES         MADIFX_PT_IN_BASE
+#define MADIFX_PT_IN_MADI(n)     (MADIFX_PT_IN_BASE + NUM_DMA_CH_PAGES + (n) * NUM_DMA_CH_PAGES)
+
+/* DMA buffer size per group per direction */
+#define MADIFX_DMA_SIZE_2CH  (2 * 32768)
+#define MADIFX_DMA_SIZE_8CH  (8 * 32768)
+
 /* PCI Vendor id for HDSPe MADI FX (not found in linux headers) */
 #define PCI_VENDOR_ID_RME_MADI_FX 0x1d18
 
@@ -337,6 +366,19 @@ static const char *const texts_freq[] = {
 };
 
 
+/* Per-PCM-device state. Each group is one ALSA PCM device. */
+struct madifx_pcm_group {
+	struct mfx *mfx;
+	int type;          /* MADIFX_PCM_TYPE_* */
+	int madi_stream;   /* MADI only: 0..23 */
+	int n_channels;    /* 2 for AES/Phones, 8 for MADI */
+	struct snd_pcm *pcm;
+	struct snd_pcm_substream *playback_substream;
+	struct snd_pcm_substream *capture_substream;
+	pid_t playback_pid;
+	pid_t capture_pid;
+};
+
 struct madifx_midi {
 	struct mfx *mfx;
 	int id;
@@ -358,9 +400,6 @@ struct madifx_midi {
 
 struct mfx {
 	spinlock_t lock;
-	/* only one playback and/or capture stream */
-	struct snd_pcm_substream *capture_substream;
-	struct snd_pcm_substream *playback_substream;
 
 	char *card_name;	     /* for procinfo */
 	unsigned short firmware_rev;
@@ -393,13 +432,10 @@ struct mfx {
 	char **port_names_in_ss, **port_names_in_ds, **port_names_in_qs;
 	char **port_names_out_ss, **port_names_out_ds, **port_names_out_qs;
 
-	unsigned char *playback_buffer;	/* suitably aligned address */
-	unsigned char *capture_buffer;	/* suitably aligned address */
 	u32 *level_buffer;	/* suitably aligned address */
 
-	pid_t capture_pid;	/* process id which uses capture */
-	pid_t playback_pid;	/* process id which uses capture */
-	int running;		/* running status */
+	/* running_count tracks total active streams across all groups */
+	int running_count;
 
 	int last_external_sample_rate;	/* samplerate mystic ... */
 	int last_internal_sample_rate;
@@ -414,9 +450,15 @@ struct mfx {
 	int midiPorts;
 
 	struct snd_card *card;	/* one card */
-	struct snd_pcm *pcm;		/* has one pcm */
 	struct snd_hwdep *hwdep;	/* and a hwdep for additional ioctl */
 	struct pci_dev *pci;	/* and an pci info */
+
+	/* PCM groups: one ALSA PCM device per 8-channel slice */
+	struct madifx_pcm_group groups[MADIFX_NUM_PCM_GROUPS];
+
+	/* Dummy DMA page: safe target for unused page-table entries */
+	void *dummy_dma_area;
+	dma_addr_t dummy_dma_addr;
 
 	/* Mixer vars */
 	/* full mixer accessible over mixer ioctl or hwdep-device */
@@ -510,19 +552,48 @@ static inline void snd_madifx_enable_out(struct mfx *mfx, int i, int v)
 	madifx_write(mfx, MADIFX_ENABLE_OUTPUT + (4 * i), v);
 }
 
-/* check if same process is writing and reading */
+/* Returns 1 if at most one process has open streams across all groups. */
 static int snd_madifx_use_is_exclusive(struct mfx *mfx)
 {
 	unsigned long flags;
-	int ret = 1;
+	pid_t first_pid = -1;
+	int i, ret = 1;
 
 	spin_lock_irqsave(&mfx->lock, flags);
-	if ((mfx->playback_pid != mfx->capture_pid) &&
-	    (mfx->playback_pid >= 0) && (mfx->capture_pid >= 0)) {
-		ret = 0;
+	for (i = 0; i < MADIFX_NUM_PCM_GROUPS; i++) {
+		pid_t pp = mfx->groups[i].playback_pid;
+		pid_t cp = mfx->groups[i].capture_pid;
+		if (pp >= 0) {
+			if (first_pid < 0)
+				first_pid = pp;
+			else if (first_pid != pp) {
+				ret = 0;
+				break;
+			}
+		}
+		if (cp >= 0) {
+			if (first_pid < 0)
+				first_pid = cp;
+			else if (first_pid != cp) {
+				ret = 0;
+				break;
+			}
+		}
 	}
 	spin_unlock_irqrestore(&mfx->lock, flags);
 	return ret;
+}
+
+/* Returns true if any group has an open stream. */
+static bool madifx_any_stream_open(struct mfx *mfx)
+{
+	int i;
+	for (i = 0; i < MADIFX_NUM_PCM_GROUPS; i++) {
+		if (mfx->groups[i].capture_pid >= 0 ||
+		    mfx->groups[i].playback_pid >= 0)
+			return true;
+	}
+	return false;
 }
 
 
@@ -573,14 +644,13 @@ static inline void madifx_stop_audio(struct mfx *s)
 	madifx_write(s, MADIFX_CONTROL_REG, s->control_register);
 }
 
-static void madifx_silence_playback(struct mfx *mfx)
+static void madifx_silence_group_playback(struct madifx_pcm_group *group)
 {
-	void *buf = mfx->playback_buffer;
+	struct snd_pcm_substream *ps = group->playback_substream;
 
-	if (!buf)
-		return;
-
-	memset(buf, 0, OUTPUT_DMA_BUFFER_SIZE);
+	if (ps && ps->runtime && ps->runtime->dma_area)
+		memset(ps->runtime->dma_area, 0,
+		       ps->runtime->dma_bytes);
 }
 
 static int madifx_set_interrupt_interval(struct mfx *s, unsigned int frames)
@@ -792,14 +862,12 @@ static int madifx_set_rate(struct mfx *mfx, int rate, int called_internally)
 		return -EINVAL;
 	}
 
-	if (current_speed != target_speed
-	    && (mfx->capture_pid >= 0 || mfx->playback_pid >= 0)) {
+	if (current_speed != target_speed && madifx_any_stream_open(mfx)) {
 		dev_err
 		    (mfx->card->dev,
-		     "MADIFX: cannot change from %s speed to %s speed mode (capture PID = %d, playback PID = %d)\n",
+		     "MADIFX: cannot change from %s speed to %s speed mode (streams active)\n",
 		     madifx_speed_names[current_speed],
-		     madifx_speed_names[target_speed],
-		     mfx->capture_pid, mfx->playback_pid);
+		     madifx_speed_names[target_speed]);
 		return -EBUSY;
 	}
 
@@ -2147,11 +2215,13 @@ static irqreturn_t snd_madifx_interrupt(int irq, void *dev_id)
 
 
 	if (audio) {
-		if (mfx->capture_substream)
-			snd_pcm_period_elapsed(mfx->capture_substream);
-
-		if (mfx->playback_substream)
-			snd_pcm_period_elapsed(mfx->playback_substream);
+		int gi;
+		for (gi = 0; gi < MADIFX_NUM_PCM_GROUPS; gi++) {
+			if (mfx->groups[gi].capture_substream)
+				snd_pcm_period_elapsed(mfx->groups[gi].capture_substream);
+			if (mfx->groups[gi].playback_substream)
+				snd_pcm_period_elapsed(mfx->groups[gi].playback_substream);
+		}
 	}
 
 	if (midi) {
@@ -2188,24 +2258,25 @@ static irqreturn_t snd_madifx_interrupt(int irq, void *dev_id)
 static snd_pcm_uframes_t snd_madifx_hw_pointer(struct snd_pcm_substream
 					      *substream)
 {
-	struct mfx *mfx = snd_pcm_substream_chip(substream);
+	struct madifx_pcm_group *group = snd_pcm_substream_chip(substream);
 
-	return madifx_hw_pointer(mfx);
+	return madifx_hw_pointer(group->mfx);
 }
 
 
 static int snd_madifx_reset(struct snd_pcm_substream *substream)
 {
 	struct snd_pcm_runtime *runtime = substream->runtime;
-	struct mfx *mfx = snd_pcm_substream_chip(substream);
+	struct madifx_pcm_group *group = snd_pcm_substream_chip(substream);
+	struct mfx *mfx = group->mfx;
 	struct snd_pcm_substream *other;
 
 	if (substream->stream == SNDRV_PCM_STREAM_PLAYBACK)
-		other = mfx->capture_substream;
+		other = group->capture_substream;
 	else
-		other = mfx->playback_substream;
+		other = group->playback_substream;
 
-	if (mfx->running)
+	if (mfx->running_count > 0)
 		runtime->status->hw_ptr = madifx_hw_pointer(mfx);
 	else
 		runtime->status->hw_ptr = 0;
@@ -2224,171 +2295,133 @@ static int snd_madifx_reset(struct snd_pcm_substream *substream)
 	return 0;
 }
 
+/* --- Per-group page-table and DMA helpers -------------------------------- */
+
+static int group_pt_out_base(const struct madifx_pcm_group *g)
+{
+	switch (g->type) {
+	case MADIFX_PCM_TYPE_AES:    return MADIFX_PT_OUT_AES;
+	case MADIFX_PCM_TYPE_PHONES: return MADIFX_PT_OUT_PHONES;
+	case MADIFX_PCM_TYPE_MADI:   return MADIFX_PT_OUT_MADI(g->madi_stream);
+	}
+	return -1;
+}
+
+static int group_pt_in_base(const struct madifx_pcm_group *g)
+{
+	switch (g->type) {
+	case MADIFX_PCM_TYPE_AES:  return MADIFX_PT_IN_AES;
+	case MADIFX_PCM_TYPE_MADI: return MADIFX_PT_IN_MADI(g->madi_stream);
+	default: return -1; /* Phones has no capture */
+	}
+}
+
+static int group_pt_pages(const struct madifx_pcm_group *g)
+{
+	return (g->n_channels == 8) ? NUM_DMA_CH_PAGES : NUM_AES_PAGES;
+}
+
+static size_t group_dma_size(const struct madifx_pcm_group *g)
+{
+	return (g->n_channels == 8) ? MADIFX_DMA_SIZE_8CH : MADIFX_DMA_SIZE_2CH;
+}
+
+/* -------------------------------------------------------------------------- */
+
 static int snd_madifx_hw_params(struct snd_pcm_substream *substream,
 			       struct snd_pcm_hw_params *params)
 {
-	struct mfx *mfx = snd_pcm_substream_chip(substream);
+	struct madifx_pcm_group *group = snd_pcm_substream_chip(substream);
+	struct mfx *mfx = group->mfx;
 	int err;
 	int i;
-	pid_t this_pid;
-	pid_t other_pid;
+	pid_t this_pid, other_pid;
+	int pt_base, n_pages;
+	size_t wanted;
 
 	spin_lock_irq(&mfx->lock);
-
 	if (substream->pstr->stream == SNDRV_PCM_STREAM_PLAYBACK) {
-		this_pid = mfx->playback_pid;
-		other_pid = mfx->capture_pid;
+		this_pid  = group->playback_pid;
+		other_pid = group->capture_pid;
 	} else {
-		this_pid = mfx->capture_pid;
-		other_pid = mfx->playback_pid;
+		this_pid  = group->capture_pid;
+		other_pid = group->playback_pid;
 	}
 
 	if (other_pid > 0 && this_pid != other_pid) {
-
-		/* The other stream is open, and not by the same
-		   task as this one. Make sure that the parameters
-		   that matter are the same.
-		   */
-
 		if (params_rate(params) != mfx->system_sample_rate) {
 			spin_unlock_irq(&mfx->lock);
-			_snd_pcm_hw_param_setempty(params,
-					SNDRV_PCM_HW_PARAM_RATE);
+			_snd_pcm_hw_param_setempty(params, SNDRV_PCM_HW_PARAM_RATE);
 			return -EBUSY;
 		}
-
 		if (params_period_size(params) != mfx->period_bytes / 4) {
 			spin_unlock_irq(&mfx->lock);
-			_snd_pcm_hw_param_setempty(params,
-					SNDRV_PCM_HW_PARAM_PERIOD_SIZE);
+			_snd_pcm_hw_param_setempty(params, SNDRV_PCM_HW_PARAM_PERIOD_SIZE);
 			return -EBUSY;
 		}
-
 	}
-	/* We're fine. */
 	spin_unlock_irq(&mfx->lock);
-
-	/* how to make sure that the rate matches an externally-set one ?   */
 
 	spin_lock_irq(&mfx->lock);
 	err = madifx_set_rate(mfx, params_rate(params), 0);
 	if (err < 0) {
 		dev_info(mfx->card->dev, "err on madifx_set_rate: %d\n", err);
 		spin_unlock_irq(&mfx->lock);
-		_snd_pcm_hw_param_setempty(params,
-				SNDRV_PCM_HW_PARAM_RATE);
+		_snd_pcm_hw_param_setempty(params, SNDRV_PCM_HW_PARAM_RATE);
 		return err;
 	}
 	spin_unlock_irq(&mfx->lock);
 
-	err = madifx_set_interrupt_interval(mfx,
-			params_period_size(params));
+	err = madifx_set_interrupt_interval(mfx, params_period_size(params));
 	if (err < 0) {
 		dev_info(mfx->card->dev,
 			"err on madifx_set_interrupt_interval: %d\n", err);
-		_snd_pcm_hw_param_setempty(params,
-				SNDRV_PCM_HW_PARAM_PERIOD_SIZE);
+		_snd_pcm_hw_param_setempty(params, SNDRV_PCM_HW_PARAM_PERIOD_SIZE);
 		return err;
 	}
 
-	/* Memory allocation */
-#define NUM_AES_PAGES (32768*2/4096)
-#define NUM_MADI_PAGES (32768*192/4096)
-#define NUM_DMA_CH_PAGES (32768*8/4096)
-#define MADIFX_HW_PAGE_SIZE 4096
-
-	{
-		int wanted;
-
-		if (substream->stream == SNDRV_PCM_STREAM_PLAYBACK)
-			wanted = OUTPUT_DMA_BUFFER_SIZE;
-		else
-			wanted = INPUT_DMA_BUFFER_SIZE;
-
-		err = snd_pcm_lib_malloc_pages(substream, wanted);
-		if (err < 0) {
-			dev_info(mfx->card->dev,
-			    "err on snd_pcm_lib_malloc_pages: %d\n", err);
-			return err;
-		}
+	/* Allocate per-group DMA buffer */
+	wanted = group_dma_size(group);
+	err = snd_pcm_lib_malloc_pages(substream, wanted);
+	if (err < 0) {
+		dev_info(mfx->card->dev,
+		    "err on snd_pcm_lib_malloc_pages: %d\n", err);
+		return err;
 	}
 
+	/* Write only this group's page-table entries to hardware */
 	if (substream->stream == SNDRV_PCM_STREAM_PLAYBACK) {
-
-		/* initialise default DMA table. Will be
-		 * overwritten in a second. */
-		for (i = 0; i < MADIFX_MAX_PAGE_TABLE_SIZE/2; i++)
-			mfx->dmaPageTable[i] =
-					snd_pcm_sgbuf_get_addr(substream, 0);
-
-		/* AES Out, stereo */
-		for (i = 0; i < NUM_AES_PAGES; i++)
-			mfx->dmaPageTable[i] =
-					snd_pcm_sgbuf_get_addr(substream,
-					i * MADIFX_HW_PAGE_SIZE);
-
-		/* Phones Out, stereo */
-		for (i = 0; i < NUM_AES_PAGES; i++)
-			mfx->dmaPageTable[i+1*NUM_DMA_CH_PAGES] =
+		pt_base = group_pt_out_base(group);
+		n_pages  = group_pt_pages(group);
+		for (i = 0; i < n_pages; i++) {
+			mfx->dmaPageTable[pt_base + i] =
 				snd_pcm_sgbuf_get_addr(substream,
-					(i+1*NUM_AES_PAGES) *
-					MADIFX_HW_PAGE_SIZE);
-
-		/* MADI Out, 192 channels */
-		for (i = 0; i < NUM_MADI_PAGES; i++)
-			mfx->dmaPageTable[i+2*NUM_DMA_CH_PAGES] =
-				snd_pcm_sgbuf_get_addr(substream,
-						(i+2*NUM_AES_PAGES) *
-						MADIFX_HW_PAGE_SIZE);
-
-		for (i = 0; i < MADIFX_MAX_PAGE_TABLE_SIZE/2; i++)
-			madifx_write(mfx, MADIFX_PAGE_ADDRESS_LIST + (4 * i),
-					mfx->dmaPageTable[i]);
-
+						       i * MADIFX_HW_PAGE_SIZE);
+			madifx_write(mfx,
+				     MADIFX_PAGE_ADDRESS_LIST + 4 * (pt_base + i),
+				     mfx->dmaPageTable[pt_base + i]);
+		}
 		for (i = 0; i < 32; ++i)
 			snd_madifx_enable_out(mfx, i, 1);
 
-		mfx->playback_buffer =
-			(unsigned char *) substream->runtime->dma_area;
-		pr_debug("Allocated sample buffer for playback at %p\n",
-				mfx->playback_buffer);
+		pr_debug("Playback DMA for group %d at %p\n",
+			 group->madi_stream, substream->runtime->dma_area);
 	} else {
-		/* initialise default DMA table. Will be
-		 * overwritten in a second. */
-		for (i = MADIFX_MAX_PAGE_TABLE_SIZE/2;
-				i < MADIFX_MAX_PAGE_TABLE_SIZE; i++) {
-			mfx->dmaPageTable[i] =
-					snd_pcm_sgbuf_get_addr(substream, 0);
-		}
-
-		/* setup DMA page table */
-		/* AES In, stereo */
-		for (i = 0; i < NUM_AES_PAGES; i++) {
-			mfx->dmaPageTable[i+MADIFX_MAX_PAGE_TABLE_SIZE/2] =
+		pt_base = group_pt_in_base(group);
+		n_pages  = group_pt_pages(group);
+		for (i = 0; i < n_pages; i++) {
+			mfx->dmaPageTable[pt_base + i] =
 				snd_pcm_sgbuf_get_addr(substream,
-						i * MADIFX_HW_PAGE_SIZE);
+						       i * MADIFX_HW_PAGE_SIZE);
+			madifx_write(mfx,
+				     MADIFX_PAGE_ADDRESS_LIST + 4 * (pt_base + i),
+				     mfx->dmaPageTable[pt_base + i]);
 		}
-
-		/* MADI In, 192 channels */
-		for (i = 0; i < NUM_MADI_PAGES; i++) {
-			mfx->dmaPageTable[i + MADIFX_MAX_PAGE_TABLE_SIZE / 2 + NUM_DMA_CH_PAGES] =
-				snd_pcm_sgbuf_get_addr(substream,
-					(i + NUM_AES_PAGES) * MADIFX_HW_PAGE_SIZE);
-		}
-
-		for (i = MADIFX_MAX_PAGE_TABLE_SIZE/2;
-				i < MADIFX_MAX_PAGE_TABLE_SIZE; i++) {
-			madifx_write(mfx, MADIFX_PAGE_ADDRESS_LIST + (4 * i),
-					mfx->dmaPageTable[i]);
-		}
-
 		for (i = 0; i < 32; ++i)
 			snd_madifx_enable_in(mfx, i, 1);
 
-		mfx->capture_buffer =
-			(unsigned char *) substream->runtime->dma_area;
-		pr_debug("Allocated sample buffer for capture at %p\n",
-				mfx->capture_buffer);
+		pr_debug("Capture DMA for group %d at %p\n",
+			 group->madi_stream, substream->runtime->dma_area);
 	}
 
 	/* Switch to native float format if requested */
@@ -2412,147 +2445,60 @@ static int snd_madifx_hw_params(struct snd_pcm_substream *substream,
 
 static int snd_madifx_hw_free(struct snd_pcm_substream *substream)
 {
-	int i;
-	struct mfx *mfx = snd_pcm_substream_chip(substream);
+	struct madifx_pcm_group *group = snd_pcm_substream_chip(substream);
+	struct mfx *mfx = group->mfx;
+	int i, pt_base, n_pages;
 
 	if (substream->stream == SNDRV_PCM_STREAM_PLAYBACK) {
+		pt_base = group_pt_out_base(group);
+		n_pages  = group_pt_pages(group);
 
-		/* params_channels(params) should be enough,
-		   but to get sure in case of error */
+		/* Restore this group's page-table entries to the dummy page */
+		for (i = 0; i < n_pages; i++) {
+			mfx->dmaPageTable[pt_base + i] = mfx->dummy_dma_addr;
+			madifx_write(mfx,
+				     MADIFX_PAGE_ADDRESS_LIST + 4 * (pt_base + i),
+				     mfx->dummy_dma_addr);
+		}
 		for (i = 0; i < 32; ++i)
 			snd_madifx_enable_out(mfx, i, 0);
-
-		mfx->playback_buffer = NULL;
 	} else {
+		pt_base = group_pt_in_base(group);
+		n_pages  = group_pt_pages(group);
+
+		for (i = 0; i < n_pages; i++) {
+			mfx->dmaPageTable[pt_base + i] = mfx->dummy_dma_addr;
+			madifx_write(mfx,
+				     MADIFX_PAGE_ADDRESS_LIST + 4 * (pt_base + i),
+				     mfx->dummy_dma_addr);
+		}
 		for (i = 0; i < 32; ++i)
 			snd_madifx_enable_in(mfx, i, 0);
-
-		mfx->capture_buffer = NULL;
-
 	}
 
 	snd_pcm_lib_free_pages(substream);
-
 	return 0;
 }
 
 
+/*
+ * Per-group channel_info: each group's DMA buffer starts at offset 0.
+ * The hardware-level interleaving within each stream is:
+ *   AES/Phones: 2 channels, 64-bit frames  (step=64, first=32*ch)
+ *   MADI:       8 channels, 256-bit frames (step=256, first=32*ch)
+ */
 static int snd_madifx_channel_info(struct snd_pcm_substream *substream,
 		struct snd_pcm_channel_info *info)
 {
-	struct mfx *mfx = snd_pcm_substream_chip(substream);
+	struct madifx_pcm_group *group = snd_pcm_substream_chip(substream);
 	unsigned int channel = info->channel;
 
-	if (substream->stream == SNDRV_PCM_STREAM_PLAYBACK) {
-		int last_madi_channel = 193;
+	if (channel >= (unsigned int)group->n_channels)
+		return -EINVAL;
 
-		if (snd_BUG_ON(channel >= mfx->max_channels_out)) {
-			dev_info(mfx->card->dev,
-				"%s: output channel out of range (%d)\n",
-				__func__,
-				channel);
-			return -EINVAL;
-		}
-
-		switch (mfx->speedmode) {
-		case ss:
-		/* MADI FX Playback channel map
-	AES	   Outputstream 0 with 2 channels at byte offset 0
-	MADI	   Outputstream 1 with 8 channels at byte offset 131072
-		   Outputstream 2 with 8 channels at byte offset 393216
-		   Outputstream 3 with 8 channels at byte offset 655360
-		   Outputstream 4 with 8 channels at byte offset 917504
-		   Outputstream 5 with 8 channels at byte offset 1179648
-		   Outputstream 6 with 8 channels at byte offset 1441792
-		   Outputstream 7 with 8 channels at byte offset 1703936
-		   Outputstream 8 with 8 channels at byte offset 1966080
-		   Outputstream 9 with 8 channels at byte offset 2228224
-		   Outputstream 10 with 8 channels at byte offset 2490368
-		   Outputstream 11 with 8 channels at byte offset 2752512
-		   Outputstream 12 with 8 channels at byte offset 3014656
-		   Outputstream 13 with 8 channels at byte offset 3276800
-		   Outputstream 14 with 8 channels at byte offset 3538944
-		   Outputstream 15 with 8 channels at byte offset 3801088
-		   Outputstream 16 with 8 channels at byte offset 4063232
-		   Outputstream 17 with 8 channels at byte offset 4325376
-		   Outputstream 18 with 8 channels at byte offset 4587520
-		   Outputstream 19 with 8 channels at byte offset 4849664
-		   Outputstream 20 with 8 channels at byte offset 5111808
-		   Outputstream 21 with 8 channels at byte offset 5373952
-		   Outputstream 22 with 8 channels at byte offset 5636096
-		   Outputstream 23 with 8 channels at byte offset 5898240
-		   Outputstream 24 with 8 channels at byte offset 6160384
-	Phones	   Outputstream 25 with 2 channels at byte offset 65536
-		*/
-
-			/* Note: channels start at zero */
-			last_madi_channel = 193;
-			break;
-		case ds:
-			last_madi_channel = 97;
-			break;
-		case qs:
-			last_madi_channel = 49;
-			break;
-		}
-	info->offset = (channel < 2) ?
-	    0 : ((channel > last_madi_channel) ? 65536 :
-		    131072 + 8 * 4 * 8192 * ((channel-2)/8));
-	info->first = (channel < 2 || channel > last_madi_channel) ?
-	    32 * (channel % (last_madi_channel + 1)) :
-	    32 * ((channel-2) % 8);
-	info->step = (channel < 2 || channel > last_madi_channel) ?
-	    64 : 256;
-	} else {
-		if (snd_BUG_ON(channel >= mfx->max_channels_in)) {
-			dev_info(mfx->card->dev,
-				"%s: input channel out of range (%d)\n",
-				__func__,
-				channel);
-			return -EINVAL;
-		}
-
-		switch (mfx->speedmode) {
-		/* MADI FX Input channel map
-	AES	   Inputstream 0 with 2 channels at byte offset 0
-	MADI	   Inputstream 1 with 8 channels at byte offset 65536
-		   Inputstream 2 with 8 channels at byte offset 327680
-		   Inputstream 3 with 8 channels at byte offset 589824
-		   Inputstream 4 with 8 channels at byte offset 851968
-		   Inputstream 5 with 8 channels at byte offset 1114112
-		   Inputstream 6 with 8 channels at byte offset 1376256
-		   Inputstream 7 with 8 channels at byte offset 1638400
-		   Inputstream 8 with 8 channels at byte offset 1900544
-		   Inputstream 9 with 8 channels at byte offset 2162688
-		   Inputstream 10 with 8 channels at byte offset 2424832
-		   Inputstream 11 with 8 channels at byte offset 2686976
-		   Inputstream 12 with 8 channels at byte offset 2949120
-		   Inputstream 13 with 8 channels at byte offset 3211264
-		   Inputstream 14 with 8 channels at byte offset 3473408
-		   Inputstream 15 with 8 channels at byte offset 3735552
-		   Inputstream 16 with 8 channels at byte offset 3997696
-		   Inputstream 17 with 8 channels at byte offset 4259840
-		   Inputstream 18 with 8 channels at byte offset 4521984
-		   Inputstream 19 with 8 channels at byte offset 4784128
-		   Inputstream 20 with 8 channels at byte offset 5046272
-		   Inputstream 21 with 8 channels at byte offset 5308416
-		   Inputstream 22 with 8 channels at byte offset 5570560
-		   Inputstream 23 with 8 channels at byte offset 5832704
-		   Inputstream 24 with 8 channels at byte offset 6094848
-	       */
-		case ss:
-		case ds:
-		case qs:
-			info->offset = (channel < 2) ?
-				0 :
-				65536 + 8 * 4 * 8192 * ((channel-2)/8);
-			info->first = (channel < 2) ?
-				32 * channel :
-				32 * ((channel-2) % 8);
-			info->step = (channel < 2) ? 64 : 256;
-			break;
-		}
-	}
+	info->offset = 0;
+	info->first  = 32 * channel;
+	info->step   = (group->type == MADIFX_PCM_TYPE_MADI) ? 256 : 64;
 
 	return 0;
 }
@@ -2564,44 +2510,42 @@ static int snd_madifx_ioctl(struct snd_pcm_substream *substream,
 	switch (cmd) {
 	case SNDRV_PCM_IOCTL1_RESET:
 		return snd_madifx_reset(substream);
-
 	case SNDRV_PCM_IOCTL1_CHANNEL_INFO:
-		{
-			struct snd_pcm_channel_info *info = arg;
-
-			return snd_madifx_channel_info(substream, info);
-		}
+		return snd_madifx_channel_info(substream,
+					       (struct snd_pcm_channel_info *)arg);
 	default:
 		break;
 	}
-
 	return snd_pcm_lib_ioctl(substream, cmd, arg);
 }
 
 static int snd_madifx_trigger(struct snd_pcm_substream *substream, int cmd)
 {
-	struct mfx *mfx = snd_pcm_substream_chip(substream);
+	struct madifx_pcm_group *group = snd_pcm_substream_chip(substream);
+	struct mfx *mfx = group->mfx;
 	struct snd_pcm_substream *other;
-	int running;
+	bool start;
+	bool sync_other = false;
+	int prev_count;
 
 	spin_lock(&mfx->lock);
-	running = mfx->running;
+
 	switch (cmd) {
 	case SNDRV_PCM_TRIGGER_START:
-		running |= 1 << substream->stream;
+		start = true;
 		break;
 	case SNDRV_PCM_TRIGGER_STOP:
-		running &= ~(1 << substream->stream);
+		start = false;
 		break;
 	default:
 		snd_BUG();
 		spin_unlock(&mfx->lock);
 		return -EINVAL;
 	}
-	if (substream->stream == SNDRV_PCM_STREAM_PLAYBACK)
-		other = mfx->capture_substream;
-	else
-		other = mfx->playback_substream;
+
+	other = (substream->stream == SNDRV_PCM_STREAM_PLAYBACK)
+		? group->capture_substream
+		: group->playback_substream;
 
 	if (other) {
 		struct snd_pcm_substream *s;
@@ -2609,36 +2553,41 @@ static int snd_madifx_trigger(struct snd_pcm_substream *substream, int cmd)
 		snd_pcm_group_for_each_entry(s, substream) {
 			if (s == other) {
 				snd_pcm_trigger_done(s, substream);
-				if (cmd == SNDRV_PCM_TRIGGER_START)
-					running |= 1 << s->stream;
-				else
-					running &= ~(1 << s->stream);
-				goto _ok;
+				sync_other = true;
+				break;
 			}
 		}
-		if (cmd == SNDRV_PCM_TRIGGER_START) {
-			if (!(running & (1 << SNDRV_PCM_STREAM_PLAYBACK))
-					&& substream->stream ==
-					SNDRV_PCM_STREAM_CAPTURE)
-				madifx_silence_playback(mfx);
-		} else {
-			if (running &&
-				substream->stream == SNDRV_PCM_STREAM_PLAYBACK)
-				madifx_silence_playback(mfx);
+		if (!sync_other) {
+			/* Other stream is not in our sync group */
+			if (!start && substream->stream == SNDRV_PCM_STREAM_PLAYBACK)
+				madifx_silence_group_playback(group);
+			if (start && substream->stream == SNDRV_PCM_STREAM_CAPTURE)
+				madifx_silence_group_playback(group);
 		}
 	} else {
-		if (substream->stream == SNDRV_PCM_STREAM_CAPTURE)
-			madifx_silence_playback(mfx);
+		if (!start && substream->stream == SNDRV_PCM_STREAM_CAPTURE)
+			madifx_silence_group_playback(group);
 	}
-_ok:
-	snd_pcm_trigger_done(substream, substream);
-	if (!mfx->running && running)
-		madifx_start_audio(mfx);
-	else if (mfx->running && !running)
-		madifx_stop_audio(mfx);
-	mfx->running = running;
-	spin_unlock(&mfx->lock);
 
+	snd_pcm_trigger_done(substream, substream);
+
+	prev_count = mfx->running_count;
+	if (start) {
+		mfx->running_count++;
+		if (sync_other)
+			mfx->running_count++;
+	} else {
+		mfx->running_count--;
+		if (sync_other)
+			mfx->running_count--;
+	}
+
+	if (prev_count == 0 && mfx->running_count > 0)
+		madifx_start_audio(mfx);
+	else if (prev_count > 0 && mfx->running_count == 0)
+		madifx_stop_audio(mfx);
+
+	spin_unlock(&mfx->lock);
 	return 0;
 }
 
@@ -2695,306 +2644,96 @@ static struct snd_pcm_hardware snd_madifx_capture_subinfo = {
 	.fifo_size = 0
 };
 
-static int snd_madifx_hw_rule_in_channels_rate(struct snd_pcm_hw_params *params,
-					   struct snd_pcm_hw_rule *rule)
-{
-	struct mfx *mfx = rule->private;
-	struct snd_interval *c =
-	    hw_param_interval(params, SNDRV_PCM_HW_PARAM_CHANNELS);
-	struct snd_interval *r =
-	    hw_param_interval(params, SNDRV_PCM_HW_PARAM_RATE);
-
-	if (r->min > 96000 && r->max <= 192000) {
-		struct snd_interval t = {
-			.min = mfx->qs_in_channels,
-			.max = mfx->qs_in_channels,
-			.integer = 1,
-		};
-		return snd_interval_refine(c, &t);
-	} else if (r->min > 48000 && r->max <= 96000) {
-		struct snd_interval t = {
-			.min = mfx->ds_in_channels,
-			.max = mfx->ds_in_channels,
-			.integer = 1,
-		};
-		return snd_interval_refine(c, &t);
-	} else if (r->max < 64000) {
-		struct snd_interval t = {
-			.min = mfx->ss_in_channels,
-			.max = mfx->ss_in_channels,
-			.integer = 1,
-		};
-		return snd_interval_refine(c, &t);
-	}
-
-	return 0;
-}
-
-static int snd_madifx_hw_rule_out_channels_rate(struct snd_pcm_hw_params *
-						params,
-						struct snd_pcm_hw_rule *rule)
-{
-	struct mfx *mfx = rule->private;
-	struct snd_interval *c =
-	    hw_param_interval(params, SNDRV_PCM_HW_PARAM_CHANNELS);
-	struct snd_interval *r =
-	    hw_param_interval(params, SNDRV_PCM_HW_PARAM_RATE);
-
-	if (r->min > 96000 && r->max <= 192000) {
-		struct snd_interval t = {
-			.min = mfx->qs_out_channels,
-			.max = mfx->qs_out_channels,
-			.integer = 1,
-		};
-		return snd_interval_refine(c, &t);
-	} else if (r->min > 48000 && r->max <= 96000) {
-		struct snd_interval t = {
-			.min = mfx->ds_out_channels,
-			.max = mfx->ds_out_channels,
-			.integer = 1,
-		};
-		return snd_interval_refine(c, &t);
-	} else if (r->max < 64000) {
-		struct snd_interval t = {
-			.min = mfx->ss_out_channels,
-			.max = mfx->ss_out_channels,
-			.integer = 1,
-		};
-		return snd_interval_refine(c, &t);
-	}
-	return 0;
-}
-
-static int snd_madifx_hw_rule_rate_in_channels(struct snd_pcm_hw_params *params,
-					       struct snd_pcm_hw_rule *rule)
-{
-	struct mfx *mfx = rule->private;
-	struct snd_interval *c =
-	    hw_param_interval(params, SNDRV_PCM_HW_PARAM_CHANNELS);
-	struct snd_interval *r =
-	    hw_param_interval(params, SNDRV_PCM_HW_PARAM_RATE);
-
-	if (c->min >= mfx->ss_in_channels) {
-		struct snd_interval t = {
-			.min = 32000,
-			.max = 48000,
-			.integer = 1,
-		};
-		return snd_interval_refine(r, &t);
-	} else if (c->max <= mfx->qs_in_channels) {
-		struct snd_interval t = {
-			.min = 128000,
-			.max = 192000,
-			.integer = 1,
-		};
-		return snd_interval_refine(r, &t);
-	} else if (c->max <= mfx->ds_in_channels) {
-		struct snd_interval t = {
-			.min = 64000,
-			.max = 96000,
-			.integer = 1,
-		};
-		return snd_interval_refine(r, &t);
-	}
-
-	return 0;
-}
-static int snd_madifx_hw_rule_rate_out_channels(struct snd_pcm_hw_params *
-						params,
-						struct snd_pcm_hw_rule *rule)
-{
-	struct mfx *mfx = rule->private;
-	struct snd_interval *c =
-	    hw_param_interval(params, SNDRV_PCM_HW_PARAM_CHANNELS);
-	struct snd_interval *r =
-	    hw_param_interval(params, SNDRV_PCM_HW_PARAM_RATE);
-
-	if (c->min >= mfx->ss_out_channels) {
-		struct snd_interval t = {
-			.min = 32000,
-			.max = 48000,
-			.integer = 1,
-		};
-		return snd_interval_refine(r, &t);
-	} else if (c->max <= mfx->qs_out_channels) {
-		struct snd_interval t = {
-			.min = 128000,
-			.max = 192000,
-			.integer = 1,
-		};
-		return snd_interval_refine(r, &t);
-	} else if (c->max <= mfx->ds_out_channels) {
-		struct snd_interval t = {
-			.min = 64000,
-			.max = 96000,
-			.integer = 1,
-		};
-		return snd_interval_refine(r, &t);
-	}
-
-	return 0;
-}
-
-static int snd_madifx_hw_rule_in_channels(struct snd_pcm_hw_params *params,
-				      struct snd_pcm_hw_rule *rule)
-{
-	unsigned int list[3];
-	struct mfx *mfx = rule->private;
-	struct snd_interval *c = hw_param_interval(params,
-			SNDRV_PCM_HW_PARAM_CHANNELS);
-
-	list[0] = mfx->qs_in_channels;
-	list[1] = mfx->ds_in_channels;
-	list[2] = mfx->ss_in_channels;
-	return snd_interval_list(c, 3, list, 0);
-}
-
-static int snd_madifx_hw_rule_out_channels(struct snd_pcm_hw_params *params,
-				      struct snd_pcm_hw_rule *rule)
-{
-	unsigned int list[3];
-	struct mfx *mfx = rule->private;
-	struct snd_interval *c = hw_param_interval(params,
-			SNDRV_PCM_HW_PARAM_CHANNELS);
-
-	list[0] = mfx->qs_out_channels;
-	list[1] = mfx->ds_out_channels;
-	list[2] = mfx->ss_out_channels;
-	return snd_interval_list(c, 3, list, 0);
-}
-
 
 static int snd_madifx_playback_open(struct snd_pcm_substream *substream)
 {
-	struct mfx *mfx = snd_pcm_substream_chip(substream);
+	struct madifx_pcm_group *group = snd_pcm_substream_chip(substream);
+	struct mfx *mfx = group->mfx;
 	struct snd_pcm_runtime *runtime = substream->runtime;
 
 	spin_lock_irq(&mfx->lock);
-
 	snd_pcm_set_sync(substream);
 
-
 	runtime->hw = snd_madifx_playback_subinfo;
+	runtime->hw.channels_min      = group->n_channels;
+	runtime->hw.channels_max      = group->n_channels;
+	runtime->hw.buffer_bytes_max  = group_dma_size(group);
+	runtime->hw.period_bytes_max  = group_dma_size(group);
 
-	if (!mfx->capture_substream)
+	if (!group->capture_substream)
 		madifx_stop_audio(mfx);
 
-	mfx->playback_pid = current->pid;
-	mfx->playback_substream = substream;
+	group->playback_pid       = current->pid;
+	group->playback_substream = substream;
 
 	spin_unlock_irq(&mfx->lock);
 
 	snd_pcm_hw_constraint_msbits(runtime, 0, 32, 24);
 	snd_pcm_hw_constraint_pow2(runtime, 0, SNDRV_PCM_HW_PARAM_PERIOD_SIZE);
-
-	switch (mfx->io_type) {
-	case MADIFX:
-		snd_pcm_hw_constraint_minmax(runtime,
-					     SNDRV_PCM_HW_PARAM_PERIOD_SIZE,
-					     32, 4096);
-		snd_pcm_hw_constraint_single(runtime,
-					     SNDRV_PCM_HW_PARAM_BUFFER_SIZE,
-					     8192);
-		break;
-
-	default:
-		snd_pcm_hw_constraint_minmax(runtime,
-					     SNDRV_PCM_HW_PARAM_PERIOD_SIZE,
-					     64, 8192);
-		break;
-	}
-
-	snd_pcm_hw_rule_add(runtime, 0, SNDRV_PCM_HW_PARAM_RATE,
-			snd_madifx_hw_rule_rate_out_channels, mfx,
-			SNDRV_PCM_HW_PARAM_CHANNELS, -1);
-
-	snd_pcm_hw_rule_add(runtime, 0, SNDRV_PCM_HW_PARAM_CHANNELS,
-			snd_madifx_hw_rule_out_channels, mfx,
-			SNDRV_PCM_HW_PARAM_CHANNELS, -1);
-
-	snd_pcm_hw_rule_add(runtime, 0, SNDRV_PCM_HW_PARAM_CHANNELS,
-			snd_madifx_hw_rule_out_channels_rate, mfx,
-			SNDRV_PCM_HW_PARAM_RATE, -1);
-
+	snd_pcm_hw_constraint_minmax(runtime, SNDRV_PCM_HW_PARAM_PERIOD_SIZE,
+				     32, 4096);
+	snd_pcm_hw_constraint_single(runtime, SNDRV_PCM_HW_PARAM_BUFFER_SIZE,
+				     8192);
+	snd_pcm_hw_constraint_single(runtime, SNDRV_PCM_HW_PARAM_CHANNELS,
+				     group->n_channels);
 	return 0;
 }
 
 static int snd_madifx_playback_release(struct snd_pcm_substream *substream)
 {
-	struct mfx *mfx = snd_pcm_substream_chip(substream);
+	struct madifx_pcm_group *group = snd_pcm_substream_chip(substream);
+	struct mfx *mfx = group->mfx;
 
 	spin_lock_irq(&mfx->lock);
-
-	mfx->playback_pid = -1;
-	mfx->playback_substream = NULL;
-
+	group->playback_pid       = -1;
+	group->playback_substream = NULL;
 	spin_unlock_irq(&mfx->lock);
-
 	return 0;
 }
 
 
 static int snd_madifx_capture_open(struct snd_pcm_substream *substream)
 {
-	struct mfx *mfx = snd_pcm_substream_chip(substream);
+	struct madifx_pcm_group *group = snd_pcm_substream_chip(substream);
+	struct mfx *mfx = group->mfx;
 	struct snd_pcm_runtime *runtime = substream->runtime;
 
 	spin_lock_irq(&mfx->lock);
 	snd_pcm_set_sync(substream);
-	runtime->hw = snd_madifx_capture_subinfo;
 
-	if (!mfx->playback_substream)
+	runtime->hw = snd_madifx_capture_subinfo;
+	runtime->hw.channels_min      = group->n_channels;
+	runtime->hw.channels_max      = group->n_channels;
+	runtime->hw.buffer_bytes_max  = group_dma_size(group);
+	runtime->hw.period_bytes_max  = group_dma_size(group);
+
+	if (!group->playback_substream)
 		madifx_stop_audio(mfx);
 
-	mfx->capture_pid = current->pid;
-	mfx->capture_substream = substream;
+	group->capture_pid       = current->pid;
+	group->capture_substream = substream;
 
 	spin_unlock_irq(&mfx->lock);
 
 	snd_pcm_hw_constraint_msbits(runtime, 0, 32, 24);
 	snd_pcm_hw_constraint_pow2(runtime, 0, SNDRV_PCM_HW_PARAM_PERIOD_SIZE);
-
-	switch (mfx->io_type) {
-	case MADIFX:
-		snd_pcm_hw_constraint_minmax(runtime,
-					     SNDRV_PCM_HW_PARAM_PERIOD_SIZE,
-					     32, 4096);
-		snd_pcm_hw_constraint_single(runtime,
-					     SNDRV_PCM_HW_PARAM_BUFFER_SIZE,
-					     8192);
-		break;
-
-	default:
-		snd_pcm_hw_constraint_minmax(runtime,
-					     SNDRV_PCM_HW_PARAM_PERIOD_SIZE,
-					     64, 8192);
-		break;
-	}
-
-	snd_pcm_hw_rule_add(runtime, 0, SNDRV_PCM_HW_PARAM_RATE,
-			snd_madifx_hw_rule_rate_in_channels, mfx,
-			SNDRV_PCM_HW_PARAM_CHANNELS, -1);
-
-	snd_pcm_hw_rule_add(runtime, 0, SNDRV_PCM_HW_PARAM_CHANNELS,
-			snd_madifx_hw_rule_in_channels, mfx,
-			SNDRV_PCM_HW_PARAM_CHANNELS, -1);
-
-	snd_pcm_hw_rule_add(runtime, 0, SNDRV_PCM_HW_PARAM_CHANNELS,
-			snd_madifx_hw_rule_in_channels_rate, mfx,
-			SNDRV_PCM_HW_PARAM_RATE, -1);
-
+	snd_pcm_hw_constraint_minmax(runtime, SNDRV_PCM_HW_PARAM_PERIOD_SIZE,
+				     32, 4096);
+	snd_pcm_hw_constraint_single(runtime, SNDRV_PCM_HW_PARAM_BUFFER_SIZE,
+				     8192);
+	snd_pcm_hw_constraint_single(runtime, SNDRV_PCM_HW_PARAM_CHANNELS,
+				     group->n_channels);
 	return 0;
 }
 
 static int snd_madifx_capture_release(struct snd_pcm_substream *substream)
 {
-	struct mfx *mfx = snd_pcm_substream_chip(substream);
+	struct madifx_pcm_group *group = snd_pcm_substream_chip(substream);
+	struct mfx *mfx = group->mfx;
 
 	spin_lock_irq(&mfx->lock);
-
-	mfx->capture_pid = -1;
-	mfx->capture_substream = NULL;
-
+	group->capture_pid       = -1;
+	group->capture_substream = NULL;
 	spin_unlock_irq(&mfx->lock);
 	return 0;
 }
@@ -3222,7 +2961,12 @@ static int snd_madifx_create_hwdep(struct snd_card *card,
 /*------------------------------------------------------------
    memory interface
  ------------------------------------------------------------*/
-static int snd_madifx_preallocate_memory(struct mfx *mfx)
+
+/*
+ * Preallocate DMA pages for one PCM group.
+ * Called once per group from snd_madifx_create_pcm_group().
+ */
+static int snd_madifx_preallocate_group(struct madifx_pcm_group *group)
 {
 /*
  * https://htrd.su/en/blog/2018/06/12/why_may_linux_driver_developer_hate_distros_like_centos/
@@ -3235,113 +2979,118 @@ static int snd_madifx_preallocate_memory(struct mfx *mfx)
 #if LINUX_VERSION_CODE < KERNEL_VERSION(5, 1, 0) && !defined(RH_NEW_AUDIO_STACK)
 	int err;
 #endif
-#ifdef CONFIG_SND_MADIFX_BROKEN
-	int i;
-	int err2;
-	int lpti; /* level page table index */
-	dma_addr_t levelPageTable[MADIFX_NUM_LEVEL_PAGES];
-#endif
-	struct snd_pcm *pcm;
-	size_t wanted;
-
-	pcm = mfx->pcm;
-
-
-	wanted = max(INPUT_DMA_BUFFER_SIZE, OUTPUT_DMA_BUFFER_SIZE);
-
-	mfx->dmaPageTable = devm_kzalloc(&mfx->pci->dev, sizeof(dma_addr_t) *
-			MADIFX_MAX_PAGE_TABLE_SIZE, GFP_KERNEL);
-
-	if (!mfx->dmaPageTable) {
-		dev_err(mfx->card->dev,
-			"MADIFX: unable to kmalloc dmaPageTable memory\n");
-		return -ENOMEM;
-	}
+	struct mfx *mfx = group->mfx;
+	size_t wanted = group_dma_size(group);
 
 #if LINUX_VERSION_CODE < KERNEL_VERSION(5, 1, 0) && !defined(RH_NEW_AUDIO_STACK)
 	err =
 #endif
-	     snd_pcm_lib_preallocate_pages_for_all(pcm,
+	     snd_pcm_lib_preallocate_pages_for_all(group->pcm,
 						   SNDRV_DMA_TYPE_DEV_SG,
 #if LINUX_VERSION_CODE < KERNEL_VERSION(5, 4, 0)
 						   snd_dma_pci_data(mfx->pci),
 #else
-                            &mfx->pci->dev,
+						   &mfx->pci->dev,
 #endif
-						   wanted,
-						   wanted);
+						   wanted, wanted);
 
 #if LINUX_VERSION_CODE < KERNEL_VERSION(5, 1, 0) && !defined(RH_NEW_AUDIO_STACK)
 	if (err < 0) {
 		pr_debug("Could not preallocate %zd Bytes\n", wanted);
-
 		return err;
 	}
 #endif
 
-	pr_debug(" Preallocated %zd Bytes\n", wanted);
-
-
-#ifdef CONFIG_SND_MADIFX_BROKEN
-	/* allocate level buffer */
-	err2 = snd_devm_dma_alloc_pages(SNDRV_DMA_TYPE_DEV_SG,
-			snd_dma_pci_data(mfx->pci),
-			MADIFX_LEVEL_BUFFER_SIZE, &mfx->dmaLevelBuffer);
-	if (err2 < 0) {
-		dev_err(mfx->card->dev,
-			"MADIFX: Unable to allocate DMA level buffer\n");
-		return -ENOMEM;
-	}
-
-	/* Fill level page table */
-	for (i = 0; i < MADIFX_NUM_LEVEL_PAGES; i++) {
-		levelPageTable[i] = snd_sgbuf_get_addr(&(mfx->dmaLevelBuffer),
-				i * MADIFX_HW_PAGE_SIZE);
-
-	}
-
-	/* Write level page table to device */
-	lpti = (MADIFX == mfx->io_type) ? MADIFX_LPTI_HMFX :
-		MADIFX_LPTI_MFXT;
-
-	for (i = 0; i < MADIFX_NUM_LEVEL_PAGES; i++) {
-		madifx_write(mfx, MADIFX_PAGE_ADDRESS_LIST + (4 * (lpti + i)),
-				levelPageTable[i]);
-	}
-
-	mfx->level_buffer = (u32 *)mfx->dmaLevelBuffer.area;
-
-	memset(mfx->level_buffer, 0, MADIFX_LEVEL_BUFFER_SIZE);
-#endif /* MADFIX_BROKEN */
-
-
+	pr_debug("Preallocated %zd Bytes for group type=%d stream=%d\n",
+		 wanted, group->type, group->madi_stream);
 	return 0;
 }
 
-
 /* ------------- ALSA Devices ---------------------------- */
-static int snd_madifx_create_pcm(struct snd_card *card,
-					  struct mfx *mfx)
+
+/*
+ * Create one PCM device for a single channel group.
+ * Group 0 is AES (2ch), groups 1..24 are MADI streams (8ch each),
+ * group 25 is Phones (2ch, playback only).
+ */
+static int snd_madifx_create_pcm_group(struct snd_card *card,
+					struct madifx_pcm_group *group,
+					int device_index)
 {
 	struct snd_pcm *pcm;
+	int n_play, n_capt;
+	char name[32];
 	int err;
 
-	err = snd_pcm_new(card, mfx->card_name, 0, 1, 1, &pcm);
+	n_play = 1;
+	n_capt = (group->type == MADIFX_PCM_TYPE_PHONES) ? 0 : 1;
+
+	switch (group->type) {
+	case MADIFX_PCM_TYPE_AES:
+		snprintf(name, sizeof(name), "RME MADI FX AES");
+		break;
+	case MADIFX_PCM_TYPE_PHONES:
+		snprintf(name, sizeof(name), "RME MADI FX Phones");
+		break;
+	case MADIFX_PCM_TYPE_MADI: {
+		int port   = group->madi_stream / 8 + 1;  /* 1,2,3 */
+		int stream = group->madi_stream % 8;       /* 0..7  */
+		snprintf(name, sizeof(name), "RME MADI FX MADI%d Ch%d-%d",
+			 port, stream * 8 + 1, stream * 8 + 8);
+		break;
+	}
+	}
+
+	err = snd_pcm_new(card, name, device_index, n_play, n_capt, &pcm);
 	if (err < 0)
 		return err;
 
-	mfx->pcm = pcm;
-	pcm->private_data = mfx;
-	strcpy(pcm->name, mfx->card_name);
+	group->pcm    = pcm;
+	pcm->private_data = group;   /* chip pointer is the group, not mfx */
+	strscpy(pcm->name, name, sizeof(pcm->name));
 
 	snd_pcm_set_ops(pcm, SNDRV_PCM_STREAM_PLAYBACK,
 			&snd_madifx_playback_ops);
-	snd_pcm_set_ops(pcm, SNDRV_PCM_STREAM_CAPTURE,
-			&snd_madifx_capture_ops);
+	if (n_capt)
+		snd_pcm_set_ops(pcm, SNDRV_PCM_STREAM_CAPTURE,
+				&snd_madifx_capture_ops);
 
 	pcm->info_flags = SNDRV_PCM_INFO_JOINT_DUPLEX;
 
-	err = snd_madifx_preallocate_memory(mfx);
+	return snd_madifx_preallocate_group(group);
+}
+
+static int snd_madifx_create_pcm(struct snd_card *card, struct mfx *mfx)
+{
+	int i, err, device_index = 0;
+
+	/* Group 0: AES (2ch, in+out) */
+	mfx->groups[0].mfx        = mfx;
+	mfx->groups[0].type       = MADIFX_PCM_TYPE_AES;
+	mfx->groups[0].madi_stream = 0;
+	mfx->groups[0].n_channels  = 2;
+	err = snd_madifx_create_pcm_group(card, &mfx->groups[0], device_index++);
+	if (err < 0)
+		return err;
+
+	/* Groups 1..24: MADI streams 0..23 (8ch each, in+out) */
+	for (i = 0; i < MADIFX_NUM_MADI_STREAMS; i++) {
+		struct madifx_pcm_group *g = &mfx->groups[1 + i];
+		g->mfx        = mfx;
+		g->type       = MADIFX_PCM_TYPE_MADI;
+		g->madi_stream = i;
+		g->n_channels  = 8;
+		err = snd_madifx_create_pcm_group(card, g, device_index++);
+		if (err < 0)
+			return err;
+	}
+
+	/* Group 25: Phones (2ch, playback only) */
+	mfx->groups[25].mfx        = mfx;
+	mfx->groups[25].type       = MADIFX_PCM_TYPE_PHONES;
+	mfx->groups[25].madi_stream = 0;
+	mfx->groups[25].n_channels  = 2;
+	err = snd_madifx_create_pcm_group(card, &mfx->groups[25], device_index++);
 	if (err < 0)
 		return err;
 
@@ -3385,13 +3134,19 @@ static int snd_madifx_create_alsa_devices(struct snd_card *card,
 	pr_debug("proc init...\n");
 	snd_madifx_proc_init(mfx);
 
-	mfx->system_sample_rate = -1;
-	mfx->last_external_sample_rate = -1;
-	mfx->last_internal_sample_rate = -1;
-	mfx->playback_pid = -1;
-	mfx->capture_pid = -1;
-	mfx->capture_substream = NULL;
-	mfx->playback_substream = NULL;
+	{
+		int gi;
+		mfx->system_sample_rate = -1;
+		mfx->last_external_sample_rate = -1;
+		mfx->last_internal_sample_rate = -1;
+		mfx->running_count = 0;
+		for (gi = 0; gi < MADIFX_NUM_PCM_GROUPS; gi++) {
+			mfx->groups[gi].playback_pid       = -1;
+			mfx->groups[gi].capture_pid        = -1;
+			mfx->groups[gi].playback_substream = NULL;
+			mfx->groups[gi].capture_substream  = NULL;
+		}
+	}
 
 	pr_debug("Set defaults...\n");
 	err = snd_madifx_set_defaults(mfx);
@@ -3485,8 +3240,40 @@ static int snd_madifx_create(struct snd_card *card,
 			sizeof(*mfx->newmixer));
 
 	mfx->newmixer = devm_kzalloc(&pci->dev, sizeof(*mfx->newmixer), GFP_KERNEL);
-	if (!mfx->newmixer) {
+	if (!mfx->newmixer)
 		return -ENOMEM;
+
+	/* Allocate the dmaPageTable CPU mirror */
+	mfx->dmaPageTable = devm_kzalloc(&pci->dev,
+			sizeof(dma_addr_t) * MADIFX_MAX_PAGE_TABLE_SIZE,
+			GFP_KERNEL);
+	if (!mfx->dmaPageTable) {
+		dev_err(mfx->card->dev,
+			"MADIFX: unable to allocate dmaPageTable\n");
+		return -ENOMEM;
+	}
+
+	/*
+	 * Allocate a small coherent "dummy" page. All page-table entries are
+	 * initialised to point here so the hardware always reads from a valid
+	 * DMA address, even for channels that have no active stream.
+	 */
+	mfx->dummy_dma_area = dmam_alloc_coherent(&pci->dev,
+						  MADIFX_HW_PAGE_SIZE,
+						  &mfx->dummy_dma_addr,
+						  GFP_KERNEL);
+	if (!mfx->dummy_dma_area) {
+		dev_err(mfx->card->dev,
+			"MADIFX: unable to allocate dummy DMA page\n");
+		return -ENOMEM;
+	}
+	memset(mfx->dummy_dma_area, 0, MADIFX_HW_PAGE_SIZE);
+
+	/* Pre-fill the entire hardware page table with the dummy address */
+	for (i = 0; i < MADIFX_MAX_PAGE_TABLE_SIZE; i++) {
+		mfx->dmaPageTable[i] = mfx->dummy_dma_addr;
+		madifx_write(mfx, MADIFX_PAGE_ADDRESS_LIST + 4 * i,
+			     mfx->dummy_dma_addr);
 	}
 
 	/* This initialises the mixer to a static 1:1 routing.
