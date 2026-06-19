@@ -3558,7 +3558,7 @@ static int snd_madifx_create(struct snd_card *card,
 		break;
 	}
 
-	snprintf(card->id, sizeof(card->id), "MADIFXtest");
+	snprintf(card->id, sizeof(card->id), "MADIFX");
 	snd_card_set_id(card, card->id);
 
 	pr_debug("create alsa devices.\n");
