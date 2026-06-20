@@ -36,7 +36,7 @@ install:: install-only
 	/sbin/modprobe madifx
 
 clean::
-	rm -f core .*.cmd *.o *.ko *.mod.c Module.* modules.order *.bak .\#* *~
+	rm -f core .*.cmd *.o *.ko *.mod.c *.mod Module.* modules.order *.bak .\#* *~
 	rm -rf .tmp_versions
 
 endif
