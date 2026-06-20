@@ -2207,8 +2207,7 @@ static int snd_madifx_set_defaults(struct mfx *mfx)
     {
     case MADIFX:
         /* OSX: LAT_3+BUF_SIZ_1+BUF_SIZ_2+freq1; */
-        mfx->control_register = MADIFX_LAT_3 + MADIFX_BUF_SIZ_1 +
-            MADIFX_BUF_SIZ_2 + MADIFX_freq1;
+        mfx->control_register = MADIFX_LAT_3 + MADIFX_BUF_SIZ_1 + MADIFX_BUF_SIZ_2 + MADIFX_freq1;
         /* PRO+madi1_tx_64ch+madi2_tx_64ch+madi3_tx_64ch; */
         mfx->settings_register = 0x8 + 0x80 + 0x100 + 0x200;
         break;
@@ -3261,17 +3260,7 @@ static int snd_madifx_create_alsa_devices(struct snd_card *card,
     madifx_update_simple_mixer_controls(mfx);
 #endif
 
-    pr_debug("Initializeing complete ???\n");
-
-    err = snd_card_register(card);
-    if (err < 0)
-    {
-        dev_err(mfx->card->dev,
-                "MADIFX: error registering card\n");
-        return err;
-    }
-
-    pr_debug("... yes now\n");
+    pr_debug("Initialisation complete\n");
 
     return 0;
 }
@@ -3551,11 +3540,17 @@ error:
     return err;
 }
 
+static void snd_madifx_remove(struct pci_dev *pci)
+{
+    snd_card_free(pci_get_drvdata(pci));
+}
+
 static struct pci_driver madifx_driver =
 {
     .name = KBUILD_MODNAME,
     .id_table = snd_madifx_ids,
     .probe = snd_madifx_probe,
+    .remove = snd_madifx_remove,
 };
 
 module_pci_driver(madifx_driver);
