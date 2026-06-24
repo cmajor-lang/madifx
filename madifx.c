@@ -445,12 +445,12 @@ struct mfx
     unsigned long port;
     void __iomem *iobase;
 
-    int irq_count;		/* for debug */
+    int irq_count;              /* for debug */
     int midiPorts;
 
-    struct snd_card *card;	/* one card */
-    struct snd_hwdep *hwdep;	/* and a hwdep for additional ioctl */
-    struct pci_dev *pci;	/* and an pci info */
+    struct snd_card *card;      /* one card */
+    struct snd_hwdep *hwdep;    /* and a hwdep for additional ioctl */
+    struct pci_dev *pci;        /* and an pci info */
 
     /* PCM groups: one ALSA PCM device per 8-channel slice */
     struct madifx_pcm_group groups[MADIFX_NUM_PCM_GROUPS];
@@ -1279,7 +1279,7 @@ static int madifx_get_system_sample_rate(struct mfx *mfx)
 
 
 #define HDSPM_SYSTEM_SAMPLE_RATE(xname, xindex) \
-{	.iface = SNDRV_CTL_ELEM_IFACE_MIXER, \
+{   .iface = SNDRV_CTL_ELEM_IFACE_MIXER, \
     .name = xname, \
     .index = xindex, \
     .access = SNDRV_CTL_ELEM_ACCESS_READWRITE |\
@@ -1396,7 +1396,7 @@ static int madifx_external_freq_index(struct mfx *mfx, enum madifx_syncsource po
     snd_ctl_enum_info(info, 1, ARRAY_SIZE(texts), texts)
 
 #define HDSPM_AUTOSYNC_SAMPLE_RATE(xname, xindex) \
-{	.iface = SNDRV_CTL_ELEM_IFACE_MIXER, \
+{   .iface = SNDRV_CTL_ELEM_IFACE_MIXER, \
     .name = xname, \
     .private_value = xindex, \
     .access = SNDRV_CTL_ELEM_ACCESS_READ, \
@@ -1436,7 +1436,7 @@ static int snd_madifx_get_autosync_sample_rate(struct snd_kcontrol *kcontrol,
 }
 
 #define MADIFX_MADI_CHANNELCOUNT(xname, xindex) \
-{	.iface = SNDRV_CTL_ELEM_IFACE_MIXER, \
+{   .iface = SNDRV_CTL_ELEM_IFACE_MIXER, \
     .name = xname, \
     .private_value = xindex, \
     .access = SNDRV_CTL_ELEM_ACCESS_READ, \
@@ -1523,7 +1523,7 @@ static int madifx_system_clock_mode(struct mfx *mfx)
 
 
 #define HDSPM_INTERNAL_CLOCK(xname, xindex) \
-{	.iface = SNDRV_CTL_ELEM_IFACE_MIXER, \
+{   .iface = SNDRV_CTL_ELEM_IFACE_MIXER, \
     .name = xname, \
     .index = xindex, \
     .info = snd_madifx_info_clock_source, \
@@ -1680,7 +1680,7 @@ static int madifx_set_clock_select(struct mfx *mfx, int val)
 
 
 #define MADIFX_CLOCK_SELECT(xname, xindex) \
-{	.iface = SNDRV_CTL_ELEM_IFACE_MIXER, \
+{   .iface = SNDRV_CTL_ELEM_IFACE_MIXER, \
     .name = xname, \
     .index = xindex, \
     .access = SNDRV_CTL_ELEM_ACCESS_READWRITE |\
@@ -1744,7 +1744,7 @@ static int snd_madifx_put_clock_select(struct snd_kcontrol *kcontrol,
 
 
 #define MADIFX_TOGGLE_SETTING(xname, xindex) \
-{	.iface = SNDRV_CTL_ELEM_IFACE_MIXER, \
+{   .iface = SNDRV_CTL_ELEM_IFACE_MIXER, \
     .name = xname, \
     .private_value = xindex, \
     .info = snd_madifx_info_toggle_setting, \
@@ -1768,7 +1768,7 @@ static int madifx_set_toggle_setting(struct mfx *mfx, u32 reg, int out)
     return 0;
 }
 
-#define snd_madifx_info_toggle_setting		snd_ctl_boolean_mono_info
+#define snd_madifx_info_toggle_setting snd_ctl_boolean_mono_info
 
 static int snd_madifx_get_toggle_setting(struct snd_kcontrol *kcontrol,
                    struct snd_ctl_elem_value *ucontrol)
@@ -1803,7 +1803,7 @@ static int snd_madifx_put_toggle_setting(struct snd_kcontrol *kcontrol,
 
 
 #define HDSPM_MIXER(xname, xindex) \
-{	.iface = SNDRV_CTL_ELEM_IFACE_HWDEP, \
+{   .iface = SNDRV_CTL_ELEM_IFACE_HWDEP, \
     .name = xname, \
     .index = xindex, \
     .device = 0, \
@@ -1815,7 +1815,7 @@ static int snd_madifx_put_toggle_setting(struct snd_kcontrol *kcontrol,
 }
 
 #define HDSPM_SYNC_CHECK(xname, xindex) \
-{	.iface = SNDRV_CTL_ELEM_IFACE_MIXER, \
+{   .iface = SNDRV_CTL_ELEM_IFACE_MIXER, \
     .name = xname, \
     .private_value = xindex, \
     .access = SNDRV_CTL_ELEM_ACCESS_READ | SNDRV_CTL_ELEM_ACCESS_VOLATILE, \
@@ -2662,16 +2662,16 @@ static int snd_madifx_prepare(struct snd_pcm_substream *substream)
 static struct snd_pcm_hardware snd_madifx_playback_subinfo =
 {
     .info = (SNDRV_PCM_INFO_MMAP |
-         SNDRV_PCM_INFO_MMAP_VALID |
-         SNDRV_PCM_INFO_COMPLEX |
-         SNDRV_PCM_INFO_SYNC_START),
+             SNDRV_PCM_INFO_MMAP_VALID |
+             SNDRV_PCM_INFO_INTERLEAVED |
+             SNDRV_PCM_INFO_SYNC_START),
     .formats = SNDRV_PCM_FMTBIT_S32_LE | SNDRV_PCM_FMTBIT_FLOAT_LE,
     .rates = (SNDRV_PCM_RATE_32000 |
-          SNDRV_PCM_RATE_44100 |
-          SNDRV_PCM_RATE_48000 |
-          SNDRV_PCM_RATE_64000 |
-          SNDRV_PCM_RATE_88200 | SNDRV_PCM_RATE_96000 |
-          SNDRV_PCM_RATE_176400 | SNDRV_PCM_RATE_192000),
+              SNDRV_PCM_RATE_44100 |
+              SNDRV_PCM_RATE_48000 |
+              SNDRV_PCM_RATE_64000 |
+              SNDRV_PCM_RATE_88200 | SNDRV_PCM_RATE_96000 |
+              SNDRV_PCM_RATE_176400 | SNDRV_PCM_RATE_192000),
     .rate_min = 32000,
     .rate_max = 192000,
     .channels_min = 1,
