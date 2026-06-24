@@ -785,32 +785,25 @@ static int madifx_set_rate(struct mfx *mfx, int rate, int called_internally)
        it (e.g. during module initialization).
      */
 
-    if (1 == madifx_system_clock_mode(mfx))
+    if (madifx_system_clock_mode(mfx) == 1)
     {
-
         /* SLAVE --- */
         if (called_internally)
         {
-
             /* request from ctl or card initialization
                just make a warning an remember setting
                for future master mode switching */
 
-            dev_warn(mfx->card->dev,
-                "MADIFX: Warning: device is not running as a clock master.\n");
+            dev_warn(mfx->card->dev, "MADIFX: Warning: device is not running as a clock master.\n");
             not_set = 1;
         }
         else
         {
             int external_freq = madifx_get_external_rate(mfx);
 
-
-
             if (rate != external_freq)
             {
-                dev_warn(mfx->card->dev,
-                    "MADIFX: Warning: Requested rate %d doesn't match external rate %d\n",
-                    rate, external_freq);
+                dev_warn(mfx->card->dev, "MADIFX: Warning: Requested rate %d doesn't match external rate %d\n", rate, external_freq);
                 not_set = 1;
             }
         }
@@ -818,7 +811,7 @@ static int madifx_set_rate(struct mfx *mfx, int rate, int called_internally)
 
     current_rate = mfx->system_sample_rate;
 
-    /* Changing between Singe, Double and Quad speed is not
+    /* Changing between Single, Double and Quad speed is not
        allowed if any substreams are open. This is because such a change
        causes a shift in the location of the DMA buffers and a reduction
        in the number of available buffers.
@@ -877,11 +870,9 @@ static int madifx_set_rate(struct mfx *mfx, int rate, int called_internally)
 
     if (current_speed != target_speed && madifx_any_stream_open(mfx))
     {
-        dev_err
-            (mfx->card->dev,
-             "MADIFX: cannot change from %s speed to %s speed mode (streams active)\n",
-             madifx_speed_names[current_speed],
-             madifx_speed_names[target_speed]);
+        dev_err(mfx->card->dev, "MADIFX: cannot change from %s speed to %s speed mode (streams active)\n",
+                                madifx_speed_names[current_speed],
+                                madifx_speed_names[target_speed]);
         return -EBUSY;
     }
 
@@ -928,15 +919,13 @@ static int madifx_set_rate(struct mfx *mfx, int rate, int called_internally)
    MIDI
   ----------------------------------------------------------------------------*/
 
-static inline unsigned char snd_madifx_midi_read_byte(struct mfx *mfx,
-                              int id)
+static inline unsigned char snd_madifx_midi_read_byte(struct mfx *mfx, int id)
 {
     /* the hardware already does the relevant bit-mask with 0xff */
     return madifx_read(mfx, mfx->midi[id].dataIn);
 }
 
-static inline void snd_madifx_midi_write_byte(struct mfx *mfx, int id,
-                          int val)
+static inline void snd_madifx_midi_write_byte(struct mfx *mfx, int id, int val)
 {
     /* the hardware already does the relevant bit-mask with 0xff */
     return madifx_write(mfx, mfx->midi[id].dataOut, val);
@@ -975,35 +964,33 @@ static int snd_madifx_midi_output_write(struct madifx_midi *hmidi)
     /* Output is not interrupt driven */
 
     spin_lock_irqsave(&hmidi->lock, flags);
+
     if (hmidi->output && !snd_rawmidi_transmit_empty(hmidi->output))
     {
-        n_pending = snd_madifx_midi_output_possible(hmidi->mfx,
-                                hmidi->id);
+        n_pending = snd_madifx_midi_output_possible(hmidi->mfx, hmidi->id);
+
         if (n_pending > 0)
         {
             if (n_pending > (int)sizeof(buf))
                 n_pending = sizeof(buf);
 
-            to_write = snd_rawmidi_transmit(hmidi->output, buf,
-                             n_pending);
+            to_write = snd_rawmidi_transmit(hmidi->output, buf, n_pending);
+
             if (to_write > 0)
             {
                 for (int i = 0; i < to_write; ++i)
-                    snd_madifx_midi_write_byte(hmidi->mfx,
-                                   hmidi->id,
-                                   buf[i]);
+                    snd_madifx_midi_write_byte(hmidi->mfx, hmidi->id, buf[i]);
             }
         }
     }
+
     spin_unlock_irqrestore(&hmidi->lock, flags);
     return 0;
 }
 
 static int snd_madifx_midi_input_read(struct madifx_midi *hmidi)
 {
-    unsigned char buf[128]; /* this buffer is designed to match the MIDI
-                 * input FIFO size
-                 */
+    unsigned char buf[128]; /* this buffer is designed to match the MIDI input FIFO size */
     unsigned long flags;
     int n_pending;
 
@@ -1015,35 +1002,33 @@ static int snd_madifx_midi_input_read(struct madifx_midi *hmidi)
         {
             if (n_pending > (int)sizeof(buf))
                 n_pending = sizeof(buf);
+
             for (int i = 0; i < n_pending; ++i)
-                buf[i] = snd_madifx_midi_read_byte(hmidi->mfx,
-                                   hmidi->id);
+                buf[i] = snd_madifx_midi_read_byte(hmidi->mfx, hmidi->id);
+
             if (n_pending)
-                snd_rawmidi_receive(hmidi->input, buf,
-                             n_pending);
+                snd_rawmidi_receive(hmidi->input, buf, n_pending);
         }
         else
         {
             /* flush the MIDI input FIFO */
             while (n_pending--)
-                snd_madifx_midi_read_byte(hmidi->mfx,
-                              hmidi->id);
+                snd_madifx_midi_read_byte(hmidi->mfx, hmidi->id);
         }
     }
+
     hmidi->pending = 0;
     spin_unlock_irqrestore(&hmidi->lock, flags);
 
     spin_lock_irqsave(&hmidi->mfx->lock, flags);
     hmidi->mfx->control_register |= hmidi->ie;
-    madifx_write(hmidi->mfx, MADIFX_CONTROL_REG,
-            hmidi->mfx->control_register);
+    madifx_write(hmidi->mfx, MADIFX_CONTROL_REG, hmidi->mfx->control_register);
     spin_unlock_irqrestore(&hmidi->mfx->lock, flags);
 
     return snd_madifx_midi_output_write(hmidi);
 }
 
-static void
-snd_madifx_midi_input_trigger(struct snd_rawmidi_substream *substream, int up)
+static void snd_madifx_midi_input_trigger(struct snd_rawmidi_substream *substream, int up)
 {
     struct mfx *mfx;
     struct madifx_midi *hmidi;
@@ -1090,8 +1075,7 @@ static void snd_madifx_midi_output_timer(struct timer_list *t)
     spin_unlock_irqrestore(&hmidi->lock, flags);
 }
 
-static void
-snd_madifx_midi_output_trigger(struct snd_rawmidi_substream *substream, int up)
+static void snd_madifx_midi_output_trigger(struct snd_rawmidi_substream *substream, int up)
 {
     struct madifx_midi *hmidi;
     unsigned long flags;
@@ -1102,8 +1086,7 @@ snd_madifx_midi_output_trigger(struct snd_rawmidi_substream *substream, int up)
     {
         if (!hmidi->istimer)
         {
-            timer_setup(&hmidi->timer,
-                    snd_madifx_midi_output_timer, 0);
+            timer_setup(&hmidi->timer, snd_madifx_midi_output_timer, 0);
             mod_timer(&hmidi->timer, 1 + jiffies);
             hmidi->istimer++;
         }
@@ -1173,20 +1156,19 @@ static int snd_madifx_midi_output_close(struct snd_rawmidi_substream *substream)
 
 static const struct snd_rawmidi_ops snd_madifx_midi_output =
 {
-    .open =		snd_madifx_midi_output_open,
-    .close =	snd_madifx_midi_output_close,
-    .trigger =	snd_madifx_midi_output_trigger,
+    .open    = snd_madifx_midi_output_open,
+    .close   = snd_madifx_midi_output_close,
+    .trigger = snd_madifx_midi_output_trigger,
 };
 
 static const struct snd_rawmidi_ops snd_madifx_midi_input =
 {
-    .open =		snd_madifx_midi_input_open,
-    .close =	snd_madifx_midi_input_close,
-    .trigger =	snd_madifx_midi_input_trigger,
+    .open    = snd_madifx_midi_input_open,
+    .close   = snd_madifx_midi_input_close,
+    .trigger = snd_madifx_midi_input_trigger,
 };
 
-static int snd_madifx_create_midi(struct snd_card *card,
-                        struct mfx *mfx, int id)
+static int snd_madifx_create_midi(struct snd_card *card, struct mfx *mfx, int id)
 {
     int err;
     char buf[64];
@@ -1198,52 +1180,50 @@ static int snd_madifx_create_midi(struct snd_card *card,
     switch (id)
     {
     case 0:
-        mfx->midi[0].dataIn = MADIFX_midi_in0_data;
-        mfx->midi[0].statusIn = MADIFX_midi_in0_status;
-        mfx->midi[0].dataOut = MADIFX_midi_out0_data;
-        mfx->midi[0].statusOut = MADIFX_midi_out0_status;
-        mfx->midi[0].ie = MADIFX_IEN0;
-        mfx->midi[0].irq = MADIFX_mIRQ0;
+        mfx->midi[0].dataIn     = MADIFX_midi_in0_data;
+        mfx->midi[0].statusIn   = MADIFX_midi_in0_status;
+        mfx->midi[0].dataOut    = MADIFX_midi_out0_data;
+        mfx->midi[0].statusOut  = MADIFX_midi_out0_status;
+        mfx->midi[0].ie         = MADIFX_IEN0;
+        mfx->midi[0].irq        = MADIFX_mIRQ0;
         break;
 
     case 1:
-        mfx->midi[1].dataIn = MADIFX_midi_in1_data;
-        mfx->midi[1].statusIn = MADIFX_midi_in1_status;
-        mfx->midi[1].dataOut = MADIFX_midi_out1_data;
-        mfx->midi[1].statusOut = MADIFX_midi_out1_status;
-        mfx->midi[1].ie = MADIFX_IEN1;
-        mfx->midi[1].irq = MADIFX_mIRQ1;
+        mfx->midi[1].dataIn     = MADIFX_midi_in1_data;
+        mfx->midi[1].statusIn   = MADIFX_midi_in1_status;
+        mfx->midi[1].dataOut    = MADIFX_midi_out1_data;
+        mfx->midi[1].statusOut  = MADIFX_midi_out1_status;
+        mfx->midi[1].ie         = MADIFX_IEN1;
+        mfx->midi[1].irq        = MADIFX_mIRQ1;
         break;
 
     case 2:
-        mfx->midi[2].dataIn = MADIFX_midi_in2_data;
-        mfx->midi[2].statusIn = MADIFX_midi_in2_status;
-        mfx->midi[2].dataOut = MADIFX_midi_out2_data;
-        mfx->midi[2].statusOut = MADIFX_midi_out2_status;
-        mfx->midi[2].ie = MADIFX_IEN2;
-        mfx->midi[2].irq = MADIFX_mIRQ2;
+        mfx->midi[2].dataIn     = MADIFX_midi_in2_data;
+        mfx->midi[2].statusIn   = MADIFX_midi_in2_status;
+        mfx->midi[2].dataOut    = MADIFX_midi_out2_data;
+        mfx->midi[2].statusOut  = MADIFX_midi_out2_status;
+        mfx->midi[2].ie         = MADIFX_IEN2;
+        mfx->midi[2].irq        = MADIFX_mIRQ2;
         break;
 
     case 3:
-        mfx->midi[3].dataIn = MADIFX_midi_in3_data;
-        mfx->midi[3].statusIn = MADIFX_midi_in3_status;
-        mfx->midi[3].dataOut = MADIFX_midi_out3_data;
-        mfx->midi[3].statusOut = MADIFX_midi_out3_status;
-        mfx->midi[3].ie = MADIFX_IEN3;
-        mfx->midi[3].irq = MADIFX_mIRQ3;
+        mfx->midi[3].dataIn     = MADIFX_midi_in3_data;
+        mfx->midi[3].statusIn   = MADIFX_midi_in3_status;
+        mfx->midi[3].dataOut    = MADIFX_midi_out3_data;
+        mfx->midi[3].statusOut  = MADIFX_midi_out3_status;
+        mfx->midi[3].ie         = MADIFX_IEN3;
+        mfx->midi[3].irq        = MADIFX_mIRQ3;
         break;
 
     default:
-        dev_err(mfx->card->dev,
-                "MADIFX: Unknown MIDI port %i\n", id);
+        dev_err(mfx->card->dev, "MADIFX: Unknown MIDI port %i\n", id);
         return -EINVAL;
 
     }
 
     snprintf(buf, sizeof(buf), "%s MIDIoverMADI %d", card->shortname, id+1);
 
-    err = snd_rawmidi_new(card, buf, id, 1, 1,
-            &mfx->midi[id].rmidi);
+    err = snd_rawmidi_new(card, buf, id, 1, 1, &mfx->midi[id].rmidi);
     if (err < 0)
         return err;
 
@@ -1253,17 +1233,12 @@ static int snd_madifx_create_midi(struct snd_card *card,
             card->id, id+1);
     mfx->midi[id].rmidi->private_data = &mfx->midi[id];
 
-    snd_rawmidi_set_ops(mfx->midi[id].rmidi,
-            SNDRV_RAWMIDI_STREAM_OUTPUT,
-            &snd_madifx_midi_output);
-    snd_rawmidi_set_ops(mfx->midi[id].rmidi,
-            SNDRV_RAWMIDI_STREAM_INPUT,
-            &snd_madifx_midi_input);
+    snd_rawmidi_set_ops(mfx->midi[id].rmidi, SNDRV_RAWMIDI_STREAM_OUTPUT, &snd_madifx_midi_output);
+    snd_rawmidi_set_ops(mfx->midi[id].rmidi, SNDRV_RAWMIDI_STREAM_INPUT, &snd_madifx_midi_input);
 
-    mfx->midi[id].rmidi->info_flags |=
-        SNDRV_RAWMIDI_INFO_OUTPUT |
-        SNDRV_RAWMIDI_INFO_INPUT |
-        SNDRV_RAWMIDI_INFO_DUPLEX;
+    mfx->midi[id].rmidi->info_flags |= SNDRV_RAWMIDI_INFO_OUTPUT |
+                                       SNDRV_RAWMIDI_INFO_INPUT |
+                                       SNDRV_RAWMIDI_INFO_DUPLEX;
 
     return 0;
 }
@@ -1288,9 +1263,6 @@ static void madifx_midi_work(struct work_struct *work)
   Status Interface
   ----------------------------------------------------------------------------*/
 
-/* get the system sample rate which is set */
-
-
 /*
  * Calculate the real sample rate from the
  * current DDS value.
@@ -1300,8 +1272,7 @@ static int madifx_get_system_sample_rate(struct mfx *mfx)
     unsigned int period, rate;
 
     period = madifx_read(mfx, MADIFX_RD_PLL_FREQ);
-    rate = madifx_calc_dds_value(mfx, period) *
-        madifx_speed_multiplier(mfx);
+    rate = madifx_calc_dds_value(mfx, period) * madifx_speed_multiplier(mfx);
 
     return rate;
 }
@@ -1318,8 +1289,7 @@ static int madifx_get_system_sample_rate(struct mfx *mfx)
     .get = snd_madifx_get_system_sample_rate \
 }
 
-static int snd_madifx_info_system_sample_rate(struct snd_kcontrol *kcontrol,
-                          struct snd_ctl_elem_info *uinfo)
+static int snd_madifx_info_system_sample_rate(struct snd_kcontrol *kcontrol, struct snd_ctl_elem_info *uinfo)
 {
     uinfo->type = SNDRV_CTL_ELEM_TYPE_INTEGER;
     uinfo->count = 1;
@@ -1330,9 +1300,7 @@ static int snd_madifx_info_system_sample_rate(struct snd_kcontrol *kcontrol,
 }
 
 
-static int snd_madifx_get_system_sample_rate(struct snd_kcontrol *kcontrol,
-                         struct snd_ctl_elem_value *
-                         ucontrol)
+static int snd_madifx_get_system_sample_rate(struct snd_kcontrol *kcontrol, struct snd_ctl_elem_value *ucontrol)
 {
     struct mfx *mfx = snd_kcontrol_chip(kcontrol);
 
@@ -1340,9 +1308,7 @@ static int snd_madifx_get_system_sample_rate(struct snd_kcontrol *kcontrol,
     return 0;
 }
 
-static int snd_madifx_put_system_sample_rate(struct snd_kcontrol *kcontrol,
-                         struct snd_ctl_elem_value *
-                         ucontrol)
+static int snd_madifx_put_system_sample_rate(struct snd_kcontrol *kcontrol, struct snd_ctl_elem_value *ucontrol)
 {
     struct mfx *mfx = snd_kcontrol_chip(kcontrol);
 
@@ -1350,10 +1316,7 @@ static int snd_madifx_put_system_sample_rate(struct snd_kcontrol *kcontrol,
     return 0;
 }
 
-
-
-static int madifx_external_freq_index(struct mfx *mfx,
-                      enum madifx_syncsource port)
+static int madifx_external_freq_index(struct mfx *mfx, enum madifx_syncsource port)
 {
     int i = 0;
     int freq0_bit;
@@ -1367,27 +1330,27 @@ static int madifx_external_freq_index(struct mfx *mfx,
     switch (port)
     {
     case syncsource_madi1:
-        lock_bit = MADIFX_madi1_lock;
+        lock_bit  = MADIFX_madi1_lock;
         freq0_bit = MADIFX_madi1_freq0;
         break;
     case syncsource_madi2:
-        lock_bit = MADIFX_madi2_lock;
+        lock_bit  = MADIFX_madi2_lock;
         freq0_bit = MADIFX_madi2_freq0;
         break;
     case syncsource_madi3:
-        lock_bit = MADIFX_madi3_lock;
+        lock_bit  = MADIFX_madi3_lock;
         freq0_bit = MADIFX_madi3_freq0;
         break;
     case syncsource_aes:
-        lock_bit = MADIFX_aes_lock;
+        lock_bit  = MADIFX_aes_lock;
         freq0_bit = MADIFX_aes_freq0;
         break;
     case syncsource_wc:
-        lock_bit = MADIFX_word_lock;
+        lock_bit  = MADIFX_word_lock;
         freq0_bit = MADIFX_word_freq0;
         break;
     case syncsource_syncin:
-        lock_bit = MADIFX_sync_in_lock;
+        lock_bit  = MADIFX_sync_in_lock;
         freq0_bit = MADIFX_sync_in_freq0;
         break;
     default:
@@ -2471,7 +2434,7 @@ static int snd_madifx_hw_params(struct snd_pcm_substream *substream,
         for (int i = 0; i < 32; ++i)
             snd_madifx_enable_out(mfx, i, 1);
 
-        pr_debug("Playback DMA for group %d at %p\n",
+        dev_info(mfx->card->dev, "Playback DMA for group %d at %p\n",
              group->madi_stream, substream->runtime->dma_area);
     }
     else
@@ -2490,7 +2453,7 @@ static int snd_madifx_hw_params(struct snd_pcm_substream *substream,
         for (int i = 0; i < 32; ++i)
             snd_madifx_enable_in(mfx, i, 1);
 
-        pr_debug("Capture DMA for group %d at %p\n",
+        dev_info(mfx->card->dev, "Capture DMA for group %d at %p\n",
              group->madi_stream, substream->runtime->dma_area);
     }
 
@@ -3095,13 +3058,12 @@ static int snd_madifx_preallocate_group(struct madifx_pcm_group *group)
 #if LINUX_VERSION_CODE < KERNEL_VERSION(5, 1, 0) && !defined(RH_NEW_AUDIO_STACK)
     if (err < 0)
     {
-        pr_debug("Could not preallocate %zd Bytes\n", wanted);
+        dev_info(mfx->card->dev, "Could not preallocate %zd Bytes\n", wanted);
         return err;
     }
 #endif
 
-    pr_debug("Preallocated %zd Bytes for group type=%d stream=%d\n",
-         wanted, group->type, group->madi_stream);
+    dev_info(mfx->card->dev, "Preallocated %zd Bytes for group type=%d stream=%d\n", wanted, group->type, group->madi_stream);
     return 0;
 }
 
@@ -3209,7 +3171,7 @@ static int snd_madifx_create_alsa_devices(struct snd_card *card,
 {
     int err;
 
-    pr_debug("Create card...\n");
+    dev_info(mfx->card->dev, "Create card...\n");
     err = snd_madifx_create_pcm(card, mfx);
     if (err < 0)
         return err;
@@ -3231,7 +3193,7 @@ static int snd_madifx_create_alsa_devices(struct snd_card *card,
     if (err < 0)
         return err;
 
-    pr_debug("proc init...\n");
+    dev_info(mfx->card->dev, "proc init...\n");
     snd_madifx_proc_init(mfx);
 
     {
@@ -3249,18 +3211,12 @@ static int snd_madifx_create_alsa_devices(struct snd_card *card,
         }
     }
 
-    pr_debug("Set defaults...\n");
+    dev_info(mfx->card->dev, "Set defaults...\n");
     err = snd_madifx_set_defaults(mfx);
     if (err < 0)
         return err;
 
-    pr_debug("Update mixer controls...\n");
-#if 0
-    /* FIXME: MADI FX disable, old mixer is broken */
-    madifx_update_simple_mixer_controls(mfx);
-#endif
-
-    pr_debug("Initialisation complete\n");
+    dev_info(mfx->card->dev, "Initialisation complete\n");
 
     return 0;
 }
@@ -3313,7 +3269,7 @@ static int snd_madifx_create(struct snd_card *card,
     io_extent = pci_resource_len(pci, 0);
 
     mfx->iobase = pcim_iomap_table(pci)[0];
-    pr_debug("remapped region (0x%lx) 0x%lx-0x%lx\n",
+    dev_info(mfx->card->dev, "remapped region (0x%lx) 0x%lx-0x%lx\n",
             (unsigned long)mfx->iobase, mfx->port,
             mfx->port + io_extent - 1);
 
@@ -3324,11 +3280,11 @@ static int snd_madifx_create(struct snd_card *card,
         return -EBUSY;
     }
 
-    pr_debug("use IRQ %d\n", pci->irq);
+    dev_info(mfx->card->dev, "use IRQ %d\n", pci->irq);
 
     mfx->irq = pci->irq;
 
-    pr_debug("kmalloc Mixer memory of %zd Bytes\n",
+    dev_info(mfx->card->dev, "kmalloc Mixer memory of %zd Bytes\n",
             sizeof(*mfx->newmixer));
 
     mfx->newmixer = devm_kzalloc(&pci->dev, sizeof(*mfx->newmixer), GFP_KERNEL);
@@ -3449,7 +3405,7 @@ static int snd_madifx_create(struct snd_card *card,
     snprintf(card->id, sizeof(card->id), "MADIFX");
     snd_card_set_id(card, card->id);
 
-    pr_debug("create alsa devices.\n");
+    dev_info(mfx->card->dev, "create alsa devices.\n");
     err = snd_madifx_create_alsa_devices(card, mfx);
     if (err < 0)
         return err;
